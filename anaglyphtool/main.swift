@@ -216,13 +216,13 @@ class StereoDisparityAnalyzer {
 			print("    Analyzing \(samplePoints.count) sample points...")
 		}
 		
-		// Create thread-safe array for results
-		let disparities = NSMutableArray()
+		// Use a concurrent queue with a barrier for thread-safe array access
+		var disparities: [Float] = []
+		let disparityQueue = DispatchQueue(label: "disparity.queue", attributes: .concurrent)
 		let dispatchGroup = DispatchGroup()
 		let queue = DispatchQueue.global(qos: .userInitiated)
-		let maxConcurrent = ProcessInfo.processInfo.activeProcessorCount * 2
-		let semaphore = DispatchSemaphore(value: maxConcurrent)
-		
+		let semaphore = DispatchSemaphore(value: ProcessInfo.processInfo.activeProcessorCount * 2)
+
 		// Pre-render images to CGImages for faster pixel access
 		let startRender = Date()
 		let leftCG = context.createCGImage(left, from: left.extent)
@@ -255,7 +255,10 @@ class StereoDisparityAnalyzer {
 					blockSize: blockSize,
 					searchRange: searchRange
 				) {
-					disparities.add(disparity)
+					// Thread-safe append using barrier
+					disparityQueue.async(flags: .barrier) {
+						disparities.append(disparity)
+					}
 				}
 			}
 		}
@@ -267,8 +270,8 @@ class StereoDisparityAnalyzer {
 			print("    Block matching: \(String(format: "%.2f", Date().timeIntervalSince(startAnalysis)))s")
 		}
 		
-		// Convert to Swift array
-		return disparities.compactMap { $0 as? Float }
+		// Return the collected disparities
+		return disparities
 	}
 	
 	// Find disparities using block matching (parallelized)
@@ -305,12 +308,13 @@ class StereoDisparityAnalyzer {
 			print("    Sampling \(samplePoints.count) points (parallelized)...")
 		}
 		
-		// Create thread-safe array for results
-		let disparities = NSMutableArray()
+		// Use a concurrent queue with a barrier for thread-safe array access
+		var disparities: [Float] = []
+		let disparityQueue = DispatchQueue(label: "disparity.queue", attributes: .concurrent)
 		let dispatchGroup = DispatchGroup()
 		let queue = DispatchQueue.global(qos: .userInitiated)
 		let semaphore = DispatchSemaphore(value: ProcessInfo.processInfo.activeProcessorCount * 2)
-		
+
 		// Pre-render images to CGImages for faster pixel access
 		let leftCG = context.createCGImage(left, from: left.extent)
 		let rightCG = context.createCGImage(right, from: right.extent)
@@ -336,7 +340,10 @@ class StereoDisparityAnalyzer {
 					blockSize: blockSize,
 					searchRange: searchRange
 				) {
-					disparities.add(disparity)
+					// Thread-safe append using barrier
+					disparityQueue.async(flags: .barrier) {
+						disparities.append(disparity)
+					}
 				}
 			}
 		}
@@ -344,8 +351,8 @@ class StereoDisparityAnalyzer {
 		// Wait for all computations to complete
 		dispatchGroup.wait()
 		
-		// Convert to Swift array
-		return disparities.compactMap { $0 as? Float }
+		// Return the collected disparities
+		return disparities
 	}
 	
 	// Optimized disparity calculation using pre-rendered CGImages
@@ -400,14 +407,21 @@ class StereoDisparityAnalyzer {
 			return nil
 		}
 		
-		// Get pixel data
-		guard let leftData = leftCG.dataProvider?.data as Data?,
-			  let rightData = rightCG.dataProvider?.data as Data? else {
+		// Get pixel data - create local copies to avoid retention issues
+		guard let leftProvider = leftCG.dataProvider,
+			  let rightProvider = rightCG.dataProvider,
+			  let leftCFData = leftProvider.data,
+			  let rightCFData = rightProvider.data else {
 			return nil
 		}
 		
+		// Convert to Data for safe access
+		let leftData = leftCFData as Data
+		let rightData = rightCFData as Data
+
 		let leftBytesPerRow = leftCG.bytesPerRow
 		let rightBytesPerRow = rightCG.bytesPerRow
+		let bytesPerPixel = leftCG.bitsPerPixel / 8
 		
 		var bestDisparity: Float = 0
 		var bestScore: Float = Float.infinity
@@ -425,11 +439,16 @@ class StereoDisparityAnalyzer {
 					let rightX = point.x + dx - xOffset
 					let rightY = point.y + dy
 					
+					// Check bounds
+					guard rightX >= 0 else { continue }
+
 					// Calculate pixel indices
-					let leftIndex = leftY * leftBytesPerRow + leftX * 4
-					let rightIndex = rightY * rightBytesPerRow + rightX * 4
+					let leftIndex = leftY * leftBytesPerRow + leftX * bytesPerPixel
+					let rightIndex = rightY * rightBytesPerRow + rightX * bytesPerPixel
 					
-					if leftIndex + 2 < leftData.count && rightIndex + 2 < rightData.count {
+					// Ensure we're within bounds
+					if leftIndex >= 0 && leftIndex + 2 < leftData.count &&
+						rightIndex >= 0 && rightIndex + 2 < rightData.count {
 						// Calculate difference in grayscale
 						let leftGray = Float(leftData[leftIndex]) * 0.299 +
 						Float(leftData[leftIndex + 1]) * 0.587 +
