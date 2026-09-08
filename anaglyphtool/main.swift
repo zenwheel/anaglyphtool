@@ -7,6 +7,7 @@
 
 import Foundation
 import CoreImage
+import CoreImage.CIFilterBuiltins
 import AppKit
 import Metal
 import ImageIO
@@ -128,11 +129,19 @@ enum AnaglyphFilter {
 class StereoDisparityAnalyzer {
 
 	struct DisparityResult {
-		let suggestedOffset: Int
-		let nearDisparity: Float   // Disparity of closest objects
-		let farDisparity: Float    // Disparity of furthest objects
-		let mainSubjectDisparity: Float  // Estimated main subject
+		let suggestedOffset: Int         // Horizontal convergence shift, full-resolution pixels
+		let verticalCorrection: Int      // Pixels to move the right eye up (+) or down (-) to align rows
+		let nearDisparity: Float         // Disparity of the nearest reliable content (full-res px)
+		let farDisparity: Float          // Disparity of the furthest reliable content (full-res px)
+		let mainSubjectDisparity: Float  // Centre-weighted median disparity (full-res px)
 		let confidence: Float
+		let sampleCount: Int
+
+		static let none = DisparityResult(
+			suggestedOffset: 0, verticalCorrection: 0,
+			nearDisparity: 0, farDisparity: 0, mainSubjectDisparity: 0,
+			confidence: 0, sampleCount: 0
+		)
 	}
 
 	// Grayscale pixels rendered once per image, safe to read from any thread
@@ -140,13 +149,23 @@ class StereoDisparityAnalyzer {
 		let pixels: [UInt8]
 		let width: Int
 		let height: Int
-
-		subscript(x: Int, y: Int) -> Float {
-			return Float(pixels[y * width + x])
-		}
 	}
 
-	// Analyze stereo pair to find optimal convergence
+	private struct Match {
+		let disparity: Float  // Analysis-scale px; positive = content sits further left in the right eye (nearer)
+		let dy: Int           // Row offset of the right-eye match (analysis-scale px)
+		let weight: Float     // Higher near the frame centre
+	}
+
+	// Matching tunables, all at analysis scale
+	private static let blockRadius = 8               // 16 x 16 comparison block
+	private static let minTexture: Float = 3.0       // Mean |horizontal gradient| a block needs to be matchable
+	private static let maxMatchError: Float = 18.0   // Mean abs difference (after brightness compensation) to accept
+	private static let uniquenessRatio: Float = 0.8  // Best match must beat the runner-up by this factor
+
+	// Analyze a stereo pair and pick the convergence that places the nearest content at screen depth.
+	// Everything else then sits behind the screen, which is the most comfortable arrangement for
+	// red/cyan anaglyphs: crossed (in-front) parallax is where ghosting is most visible and fusion fails.
 	static func analyzeDisparity(
 		left: CIImage,
 		right: CIImage,
@@ -155,95 +174,119 @@ class StereoDisparityAnalyzer {
 		fast: Bool = false
 	) -> DisparityResult {
 
-		// Adjust grid size for fast mode
-		let gridSize = fast ? 40 : 20  // Larger grid = fewer samples = faster
+		let eyeWidth = left.extent.width
+		guard eyeWidth > 0, left.extent.height > 0 else { return .none }
 
-		// Render both images to grayscale pixel buffers once, up front
+		// Matching runs on a reduced copy. Disparity scales linearly with image size, so a 1024-px
+		// analysis image gives ~1 px of full-res precision per 5 px on a typical camera, and the
+		// cost drops by the square of the scale factor. Fast mode halves the resolution again.
+		let analysisWidth: CGFloat = fast ? 512 : 1024
+		let scale = min(1, analysisWidth / eyeWidth)
+		let gridStep = fast ? 10 : 12
+
 		let startRender = Date()
-		guard let leftBuffer = renderGrayscale(left, context: context),
-			  let rightBuffer = renderGrayscale(right, context: context) else {
-			return DisparityResult(
-				suggestedOffset: 0,
-				nearDisparity: 0,
-				farDisparity: 0,
-				mainSubjectDisparity: 0,
-				confidence: 0
-			)
+		guard let leftBuffer = renderGrayscale(left, scale: scale, context: context),
+			  let rightBuffer = renderGrayscale(right, scale: scale, context: context),
+			  leftBuffer.width == rightBuffer.width,
+			  leftBuffer.height == rightBuffer.height else {
+			return .none
 		}
 
 		if verbose {
+			print("    Analysis size: \(leftBuffer.width) x \(leftBuffer.height) (scale \(String(format: "%.3f", scale)))")
 			print("    Image rendering: \(String(format: "%.2f", Date().timeIntervalSince(startRender)))s")
 		}
 
-		// Find feature points and their disparities
-		let disparities = findDisparities(
+		let (matches, candidateCount) = findMatches(
 			left: leftBuffer,
 			right: rightBuffer,
-			gridSize: gridSize,
+			gridStep: gridStep,
 			verbose: verbose
 		)
 
-		guard !disparities.isEmpty else {
-			return DisparityResult(
-				suggestedOffset: 0,
-				nearDisparity: 0,
-				farDisparity: 0,
-				mainSubjectDisparity: 0,
-				confidence: 0
-			)
+		guard matches.count >= 8 else {
+			if verbose {
+				print("    Too few reliable matches (\(matches.count)); leaving offset at 0")
+			}
+			return .none
 		}
 
-		// Sort disparities to find range
-		let sorted = disparities.sorted()
-		let nearDisparity = sorted.last ?? 0
-		let farDisparity = sorted.first ?? 0
+		let toFullRes = Float(1 / scale)
+		let disparities = matches.map { $0.disparity * toFullRes }.sorted()
+		// "Nearest" is the largest disparity still backed by a handful of samples, so a lone bad
+		// match cannot set the convergence but a small foreground object still counts
+		let support = max(5, disparities.count / 100)
+		let near = disparities[disparities.count - support]
+		let far = disparities[support - 1]
+		let mainSubject = weightedMedian(matches) * toFullRes
 
-		// Find main subject disparity (using several heuristics)
-		let mainSubjectDisparity = findMainSubjectDisparity(disparities: disparities)
+		let dys = matches.map { Float($0.dy) }.sorted()
+		let verticalCorrection = Int((percentile(dys, 0.5) * toFullRes).rounded())
 
-		// Calculate optimal offset
-		// We want to set the convergence so the main subject appears at screen depth (zero disparity)
-		// offset = -mainSubjectDisparity puts the main subject at screen depth
-		let suggestedOffset = Int(-mainSubjectDisparity)
+		// Nearest content lands just behind the screen so objects touching the frame edge don't
+		// appear to poke through the "window"
+		let nearPad = Float(eyeWidth) * 0.003
+		let suggestedOffset = Int((-(near + nearPad)).rounded())
 
-		// Calculate confidence based on disparity distribution
-		let confidence = calculateConfidence(disparities: disparities)
+		// Confidence: were enough blocks matchable, and is the near estimate supported by many samples?
+		let acceptance = Float(matches.count) / Float(max(candidateCount, 1))
+		let nearSupport = disparities.filter { $0 >= near - Float(eyeWidth) * 0.02 }.count
+		let confidence = 0.5 * min(acceptance / 0.3, 1) + 0.5 * min(Float(nearSupport) / 40, 1)
 
 		if verbose {
+			let range = near - far
 			print("\n  Disparity Analysis:")
-			print("    Samples analyzed: \(disparities.count)")
-			print("    Near objects: \(Int(nearDisparity)) pixels disparity")
-			print("    Far objects: \(Int(farDisparity)) pixels disparity")
-			print("    Main subject: \(Int(mainSubjectDisparity)) pixels disparity")
-			print("    Suggested offset: \(suggestedOffset) pixels")
+			print("    Samples analyzed: \(matches.count) of \(candidateCount) blocks")
+			print("    Near objects: \(Int(near)) pixels disparity")
+			print("    Far objects: \(Int(far)) pixels disparity")
+			print("    Main subject: \(Int(mainSubject)) pixels disparity")
+			print("    Depth range: \(Int(range)) pixels (\(String(format: "%.1f%%", range / Float(eyeWidth) * 100)) of width)")
+			if range / Float(eyeWidth) > 1.0 / 30.0 {
+				print("    Note: depth range exceeds the 1/30 comfort guideline; view smaller or use a manual offset")
+			}
+			print("    Vertical misalignment: \(verticalCorrection) pixels")
+			print("    Distribution (far -> near): \(histogram(disparities, from: far, to: near))")
+			print("    Suggested offset: \(suggestedOffset) pixels (nearest content at screen depth)")
 			print("    Confidence: \(String(format: "%.1f%%", confidence * 100))")
 		}
 
 		return DisparityResult(
 			suggestedOffset: suggestedOffset,
-			nearDisparity: nearDisparity,
-			farDisparity: farDisparity,
-			mainSubjectDisparity: mainSubjectDisparity,
-			confidence: confidence
+			verticalCorrection: verticalCorrection,
+			nearDisparity: near,
+			farDisparity: far,
+			mainSubjectDisparity: mainSubject,
+			confidence: confidence,
+			sampleCount: matches.count
 		)
 	}
 
-	// Render a CIImage into a single-channel 8-bit grayscale buffer
-	private static func renderGrayscale(_ image: CIImage, context: CIContext) -> GrayscaleBuffer? {
-		let width = Int(image.extent.width)
-		let height = Int(image.extent.height)
-
-		guard width > 0, height > 0 else {
-			return nil
+	// Render a CIImage, downscaled, into a single-channel 8-bit grayscale buffer
+	private static func renderGrayscale(_ image: CIImage, scale: CGFloat, context: CIContext) -> GrayscaleBuffer? {
+		var scaled = image
+		if scale < 1 {
+			let filter = CIFilter.lanczosScaleTransform()
+			filter.inputImage = image
+			filter.scale = Float(scale)
+			filter.aspectRatio = 1
+			guard let output = filter.outputImage else { return nil }
+			scaled = output
 		}
+
+		let extent = scaled.extent
+		let width = Int(extent.width.rounded(.down))
+		let height = Int(extent.height.rounded(.down))
+		guard width > 0, height > 0 else { return nil }
+
+		scaled = scaled.transformed(by: CGAffineTransform(translationX: -extent.origin.x, y: -extent.origin.y))
 
 		var rgba = [UInt8](repeating: 0, count: width * height * 4)
 		rgba.withUnsafeMutableBytes { buffer in
 			context.render(
-				image,
+				scaled,
 				toBitmap: buffer.baseAddress!,
 				rowBytes: width * 4,
-				bounds: image.extent,
+				bounds: CGRect(x: 0, y: 0, width: width, height: height),
 				format: .RGBA8,
 				colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 			)
@@ -251,161 +294,280 @@ class StereoDisparityAnalyzer {
 
 		var pixels = [UInt8](repeating: 0, count: width * height)
 		for i in 0..<(width * height) {
-			let r = Float(rgba[i * 4])
-			let g = Float(rgba[i * 4 + 1])
-			let b = Float(rgba[i * 4 + 2])
-			pixels[i] = UInt8(min(r * 0.299 + g * 0.587 + b * 0.114, 255))
+			let r = Int(rgba[i * 4])
+			let g = Int(rgba[i * 4 + 1])
+			let b = Int(rgba[i * 4 + 2])
+			pixels[i] = UInt8((r * 299 + g * 587 + b * 114) / 1000)
 		}
 
 		return GrayscaleBuffer(pixels: pixels, width: width, height: height)
 	}
 
-	// Find disparities using block matching (parallelized)
-	private static func findDisparities(
+	// Summed-area table so any block sum in the right eye costs four lookups
+	private static func integralImage(_ buffer: GrayscaleBuffer) -> [Int32] {
+		let stride = buffer.width + 1
+		var table = [Int32](repeating: 0, count: stride * (buffer.height + 1))
+		for y in 0..<buffer.height {
+			var rowSum: Int32 = 0
+			let rowBase = y * buffer.width
+			for x in 0..<buffer.width {
+				rowSum += Int32(buffer.pixels[rowBase + x])
+				table[(y + 1) * stride + x + 1] = table[y * stride + x + 1] + rowSum
+			}
+		}
+		return table
+	}
+
+	// Block-match a grid of sample points in parallel. Runs twice: a sparse pass with a wide
+	// vertical search finds how far the two eyes are misaligned vertically, then the full grid
+	// is matched with the vertical search centred on that answer. Matching with the wrong row
+	// offset does not just fail, it locks onto neighbouring texture and reports a confident
+	// but wrong disparity, so the vertical estimate has to come first.
+	private static func findMatches(
 		left: GrayscaleBuffer,
 		right: GrayscaleBuffer,
-		gridSize: Int,
+		gridStep: Int,
 		verbose: Bool
-	) -> [Float] {
+	) -> (matches: [Match], candidates: Int) {
 
-		let blockSize = 16  // Size of matching block
-		let searchRange = left.width / 10  // Max 10% of width for speed
+		let width = left.width
+		let height = left.height
+		let coarseDy = 6  // Rows of misalignment the sparse pass can find (analysis scale)
+		let margin = blockRadius + coarseDy + 2
+		let searchRange = width / 5  // +/-20% of the eye width covers macro subjects and pre-converged pairs
 
-		// Focus on center 80% to avoid edge artifacts
-		let startX = left.width / 10
-		let endX = left.width * 9 / 10
-		let startY = left.height / 10
-		let endY = left.height * 9 / 10
-
-		// Sample points in a grid pattern
-		var samplePoints: [(x: Int, y: Int)] = []
-		for y in stride(from: startY, to: endY, by: gridSize) {
-			for x in stride(from: startX, to: endX, by: gridSize) {
-				samplePoints.append((x: x, y: y))
+		// Sample the central 80% of the frame to stay clear of edge artifacts
+		var points: [(x: Int, y: Int)] = []
+		for y in stride(from: height / 10, to: height * 9 / 10, by: gridStep) where y >= margin && y < height - margin {
+			for x in stride(from: width / 10, to: width * 9 / 10, by: gridStep) where x >= margin && x < width - margin {
+				points.append((x: x, y: y))
 			}
 		}
 
 		if verbose {
-			print("    Analyzing \(samplePoints.count) sample points...")
+			print("    Analyzing \(points.count) sample points, search range +/-\(searchRange) px...")
 		}
 
 		let startAnalysis = Date()
+		let rightSums = integralImage(right)
 
-		// Process points in parallel; each iteration writes only to its own slot
-		var results = [Float?](repeating: nil, count: samplePoints.count)
-		results.withUnsafeMutableBufferPointer { buffer in
-			DispatchQueue.concurrentPerform(iterations: samplePoints.count) { i in
-				buffer[i] = findPointDisparity(
-					point: samplePoints[i],
-					left: left,
-					right: right,
-					blockSize: blockSize,
-					searchRange: searchRange
-				)
-			}
-		}
+		let coarsePoints = stride(from: 0, to: points.count, by: 6).map { points[$0] }
+		let coarse = matchGrid(
+			points: coarsePoints, left: left, right: right, rightSums: rightSums,
+			searchRange: searchRange, dyRange: -coarseDy...coarseDy
+		)
+		let rowOffset = coarse.count >= 8 ? Int(percentile(coarse.map { Float($0.dy) }.sorted(), 0.5)) : 0
+
+		let matches = matchGrid(
+			points: points, left: left, right: right, rightSums: rightSums,
+			searchRange: searchRange, dyRange: (rowOffset - 1)...(rowOffset + 1)
+		)
 
 		if verbose {
-			print("    Block matching: \(String(format: "%.2f", Date().timeIntervalSince(startAnalysis)))s")
+			print("    Block matching: \(String(format: "%.2f", Date().timeIntervalSince(startAnalysis)))s (row offset \(rowOffset) from \(coarse.count) coarse matches)")
+		}
+
+		return (matches, points.count)
+	}
+
+	private static func matchGrid(
+		points: [(x: Int, y: Int)],
+		left: GrayscaleBuffer,
+		right: GrayscaleBuffer,
+		rightSums: [Int32],
+		searchRange: Int,
+		dyRange: ClosedRange<Int>
+	) -> [Match] {
+
+		let width = left.width
+		let height = left.height
+		let centerX = Float(width) / 2
+		let centerY = Float(height) / 2
+
+		// Each iteration writes only to its own slot. The matcher takes raw pointers because
+		// buffer-pointer subscripts are bounds-checked in Debug builds, which made auto mode
+		// take minutes on large images.
+		var results = [Match?](repeating: nil, count: points.count)
+		left.pixels.withUnsafeBufferPointer { leftPixels in
+			right.pixels.withUnsafeBufferPointer { rightPixels in
+				rightSums.withUnsafeBufferPointer { sums in
+					results.withUnsafeMutableBufferPointer { output in
+						DispatchQueue.concurrentPerform(iterations: points.count) { i in
+							let point = points[i]
+							guard let (disparity, dy) = matchBlock(
+								x: point.x, y: point.y,
+								left: leftPixels.baseAddress!, right: rightPixels.baseAddress!, rightSums: sums.baseAddress!,
+								width: width, height: height,
+								searchRange: searchRange, dyRange: dyRange
+							) else { return }
+
+							// Gaussian falloff from the frame centre, sigma = 35% of the half-size
+							let nx = (Float(point.x) - centerX) / centerX
+							let ny = (Float(point.y) - centerY) / centerY
+							let weight = expf(-(nx * nx + ny * ny) / (2 * 0.35 * 0.35))
+							output[i] = Match(disparity: disparity, dy: dy, weight: weight)
+						}
+					}
+				}
+			}
 		}
 
 		return results.compactMap { $0 }
 	}
 
-	// Find disparity for a single point using block matching
-	private static func findPointDisparity(
-		point: (x: Int, y: Int),
-		left: GrayscaleBuffer,
-		right: GrayscaleBuffer,
-		blockSize: Int,
-		searchRange: Int
-	) -> Float? {
+	// Find the disparity of one block, or nil if the block is flat, ambiguous, or has no good match
+	private static func matchBlock(
+		x: Int, y: Int,
+		left: UnsafePointer<UInt8>,
+		right: UnsafePointer<UInt8>,
+		rightSums: UnsafePointer<Int32>,
+		width: Int, height: Int,
+		searchRange: Int, dyRange: ClosedRange<Int>
+	) -> (disparity: Float, dy: Int)? {
 
-		// Check bounds
-		let halfBlock = blockSize / 2
-		guard left.width == right.width,
-			  left.height == right.height,
-			  point.x >= halfBlock,
-			  point.x < left.width - halfBlock,
-			  point.y >= halfBlock,
-			  point.y < left.height - halfBlock else {
-			return nil
-		}
+		let side = 2 * blockRadius
+		let n = side * side
+		let x0 = x - blockRadius
+		let y0 = y - blockRadius
 
-		var bestDisparity: Float = 0
-		var bestScore = Float.infinity
-
-		// Search along the epipolar line (same y-coordinate)
-		for xOffset in stride(from: 0, through: searchRange, by: 2) {
-			var sum: Float = 0
-			var count: Float = 0
-
-			// Compare blocks
-			for dy in -halfBlock..<halfBlock {
-				let y = point.y + dy
-				for dx in -halfBlock..<halfBlock {
-					let leftX = point.x + dx
-					let rightX = leftX - xOffset
-
-					guard rightX >= 0 else { continue }
-
-					sum += abs(left[leftX, y] - right[rightX, y])
-					count += 1
-				}
-			}
-
-			if count > 0 {
-				let score = sum / count
-				if score < bestScore {
-					bestScore = score
-					bestDisparity = Float(xOffset)
-				}
+		// Flat blocks (sky, backdrop, bokeh) match everywhere and would otherwise flood the
+		// statistics with bogus zero disparities. Horizontal gradient is what a horizontal
+		// search can lock onto, so that is what we require.
+		var leftSum = 0
+		var gradient = 0
+		for row in 0..<side {
+			let base = (y0 + row) * width + x0
+			var previous = Int(left[base])
+			leftSum += previous
+			for col in 1..<side {
+				let value = Int(left[base + col])
+				leftSum += value
+				gradient += abs(value - previous)
+				previous = value
 			}
 		}
+		guard Float(gradient) / Float(side * (side - 1)) >= minTexture else { return nil }
 
-		// Only return if we have a confident match (low average difference)
-		return bestScore < 50 ? bestDisparity : nil
-	}
+		// Candidate disparities d place the right-eye block at x0 - d; keep it inside the image
+		let dMin = max(-searchRange, x0 + side - width)
+		let dMax = min(searchRange, x0)
+		guard dMax - dMin >= 8 else { return nil }
+		let count = dMax - dMin + 1
 
-	// Find the main subject disparity using heuristics
-	private static func findMainSubjectDisparity(disparities: [Float]) -> Float {
+		var cost = [Float](repeating: .infinity, count: count)
+		var costDy = [Int](repeating: 0, count: count)
+		let sumStride = width + 1
 
-		guard !disparities.isEmpty else { return 0 }
+		// Zero-mean SAD: the two halves of a single-sensor stereo shot often differ in
+		// brightness, so compare each block with its own mean removed. Summation stops
+		// early once it passes `limit`, since a candidate that expensive can neither win
+		// nor matter for the uniqueness test.
+		func blockDifference(rx0: Int, ry0: Int, limit: Int) -> Int {
+			let rightSum = Int(rightSums[(ry0 + side) * sumStride + rx0 + side])
+				- Int(rightSums[ry0 * sumStride + rx0 + side])
+				- Int(rightSums[(ry0 + side) * sumStride + rx0])
+				+ Int(rightSums[ry0 * sumStride + rx0])
+			let bias = (leftSum - rightSum) / n
 
-		// Strategy 1: Use the median of the middle 50% of disparities
-		// This assumes the main subject occupies the middle depth range
-		let sorted = disparities.sorted()
-		let q1Index = sorted.count / 4
-		let q3Index = sorted.count * 3 / 4
-		let middleRange = Array(sorted[q1Index..<q3Index])
-
-		if !middleRange.isEmpty {
-			// Use median of middle range
-			return middleRange[middleRange.count / 2]
+			var sad = 0
+			for row in 0..<side {
+				let leftBase = (y0 + row) * width + x0
+				let rightBase = (ry0 + row) * width + rx0
+				for col in 0..<side {
+					sad += abs(Int(left[leftBase + col]) - Int(right[rightBase + col]) - bias)
+				}
+				if sad > limit { break }
+			}
+			return sad
 		}
 
-		// Fallback: use overall median
-		return sorted[sorted.count / 2]
+		let acceptLimit = Int(maxMatchError * Float(n))
+		var bestTotal = acceptLimit
+		for dy in dyRange {
+			let ry0 = y0 + dy
+			guard ry0 >= 0, ry0 + side <= height else { continue }
+
+			for d in dMin...dMax {
+				let limit = Int(Float(bestTotal) / uniquenessRatio) + 1
+				let sad = blockDifference(rx0: x0 - d, ry0: ry0, limit: limit)
+				guard sad <= limit else { continue }
+
+				let score = Float(sad) / Float(n)
+				let index = d - dMin
+				if score < cost[index] {
+					cost[index] = score
+					costDy[index] = dy
+				}
+				if sad < bestTotal {
+					bestTotal = sad
+				}
+			}
+		}
+
+		var bestIndex = 0
+		var best = Float.infinity
+		for i in 0..<count where cost[i] < best {
+			best = cost[i]
+			bestIndex = i
+		}
+		guard best <= maxMatchError else { return nil }
+
+		// Uniqueness: repetitive textures (brick, foliage, railings) produce several near-equal
+		// minima, and picking one of them is a coin toss
+		var runnerUp = Float.infinity
+		for i in 0..<count where abs(i - bestIndex) >= 4 && cost[i] < runnerUp {
+			runnerUp = cost[i]
+		}
+		guard best <= runnerUp * uniquenessRatio else { return nil }
+
+		// Parabolic sub-pixel refinement around the minimum, on exact neighbour costs
+		var disparity = Float(bestIndex + dMin)
+		if bestIndex > 0 && bestIndex < count - 1 {
+			let ry0 = y0 + costDy[bestIndex]
+			let c0 = Float(blockDifference(rx0: x0 - (bestIndex + dMin - 1), ry0: ry0, limit: .max)) / Float(n)
+			let c1 = cost[bestIndex]
+			let c2 = Float(blockDifference(rx0: x0 - (bestIndex + dMin + 1), ry0: ry0, limit: .max)) / Float(n)
+			let denominator = c0 - 2 * c1 + c2
+			if denominator > 0 {
+				disparity += 0.5 * (c0 - c2) / denominator
+			}
+		}
+
+		return (disparity, costDy[bestIndex])
 	}
 
-	// Calculate confidence based on disparity distribution
-	private static func calculateConfidence(disparities: [Float]) -> Float {
-		guard disparities.count > 10 else { return 0 }
+	// Twelve-bin text histogram, e.g. "▂▃▇▅▁▁▁▁▁▁▁▂"
+	private static func histogram(_ sorted: [Float], from low: Float, to high: Float) -> String {
+		let bins = 12
+		guard high > low, !sorted.isEmpty else { return "flat" }
+		var counts = [Int](repeating: 0, count: bins)
+		for value in sorted {
+			let bin = Int((value - low) / (high - low) * Float(bins))
+			counts[min(max(bin, 0), bins - 1)] += 1
+		}
+		let bars: [Character] = Array(" ▁▂▃▄▅▆▇█")
+		let peak = Float(counts.max() ?? 1)
+		return String(counts.map { bars[min(Int(Float($0) / peak * 8), 8)] })
+	}
 
-		// Calculate standard deviation
-		let mean = disparities.reduce(0, +) / Float(disparities.count)
-		let variance = disparities.map { pow($0 - mean, 2) }.reduce(0, +) / Float(disparities.count)
-		let stdDev = sqrt(variance)
+	private static func percentile(_ sorted: [Float], _ p: Float) -> Float {
+		guard !sorted.isEmpty else { return 0 }
+		let index = Int((Float(sorted.count - 1) * p).rounded())
+		return sorted[min(max(index, 0), sorted.count - 1)]
+	}
 
-		// Lower standard deviation = more consistent disparities = higher confidence
-		// Normalize to 0-1 range
-		let normalizedStdDev = min(stdDev / 50.0, 1.0)  // 50 pixels as max expected stddev
-		let confidence = 1.0 - normalizedStdDev
-
-		// Boost confidence if we have many samples
-		let sampleBoost = min(Float(disparities.count) / 100.0, 1.0)
-
-		return confidence * 0.7 + sampleBoost * 0.3
+	// Median disparity with samples near the frame centre counting for more
+	private static func weightedMedian(_ matches: [Match]) -> Float {
+		let sorted = matches.sorted { $0.disparity < $1.disparity }
+		let total = sorted.reduce(Float(0)) { $0 + $1.weight }
+		var accumulated: Float = 0
+		for match in sorted {
+			accumulated += match.weight
+			if accumulated >= total / 2 {
+				return match.disparity
+			}
+		}
+		return sorted.last?.disparity ?? 0
 	}
 }
 
@@ -465,16 +627,19 @@ class AnaglyphConverter {
 		let extent = ciImage.extent
 		let width = extent.width
 		let height = extent.height
-		let halfWidth = width / 2
+		// Whole-pixel eye size so the split and crops never land on a half pixel
+		let eyeWidth = Int(width / 2)
+		let eyeHeight = Int(height)
+		let halfWidth = CGFloat(eyeWidth)
 
 		if verbose {
 			print("  Input dimensions: \(Int(width)) x \(Int(height))")
-			print("  Each eye: \(Int(halfWidth)) x \(Int(height))")
+			print("  Each eye: \(eyeWidth) x \(eyeHeight)")
 		}
 
 		// Extract left and right images
-		let leftRect = CGRect(x: 0, y: 0, width: halfWidth, height: height)
-		let rightRect = CGRect(x: halfWidth, y: 0, width: halfWidth, height: height)
+		let leftRect = CGRect(x: 0, y: 0, width: halfWidth, height: CGFloat(eyeHeight))
+		let rightRect = CGRect(x: halfWidth, y: 0, width: halfWidth, height: CGFloat(eyeHeight))
 
 		var leftImage = ciImage.cropped(to: leftRect)
 		var rightImage = ciImage.cropped(to: rightRect)
@@ -482,8 +647,9 @@ class AnaglyphConverter {
 		// Move right image to same position as left
 		rightImage = rightImage.transformed(by: CGAffineTransform(translationX: -halfWidth, y: 0))
 
-		// Determine offset
+		// Determine the horizontal offset and any vertical correction
 		let offset: Int
+		var verticalCorrection = 0
 		if let manual = manualOffset {
 			offset = manual
 			if verbose {
@@ -503,8 +669,10 @@ class AnaglyphConverter {
 			)
 
 			offset = disparityResult.suggestedOffset
+			verticalCorrection = disparityResult.verticalCorrection
 
-			print("  ✓ Auto-detected offset: \(offset) pixels (confidence: \(String(format: "%.0f%%", disparityResult.confidence * 100)))")
+			let vertical = verticalCorrection != 0 ? ", vertical correction: \(verticalCorrection) pixels" : ""
+			print("  ✓ Auto-detected offset: \(offset) pixels\(vertical) (confidence: \(String(format: "%.0f%%", disparityResult.confidence * 100)))")
 		} else {
 			offset = 0
 			if verbose {
@@ -512,23 +680,29 @@ class AnaglyphConverter {
 			}
 		}
 
-		// Apply offset if specified
-		if offset != 0 {
-			// Split the offset between both images for centered convergence
-			let halfOffset = CGFloat(offset) / 2.0
+		if offset != 0 || verticalCorrection != 0 {
+			// Split the offset between both eyes for centred convergence, in whole pixels: a
+			// half-pixel translation would resample (soften) both eyes, and sharp edges are what
+			// the viewer fuses on
+			let shiftLeft = offset / 2
+			let shiftRight = -(offset - shiftLeft)
 
-			// Shift left image right and right image left
-			leftImage = leftImage.transformed(by: CGAffineTransform(translationX: halfOffset, y: 0))
-			rightImage = rightImage.transformed(by: CGAffineTransform(translationX: -halfOffset, y: 0))
+			leftImage = leftImage.transformed(by: CGAffineTransform(translationX: CGFloat(shiftLeft), y: 0))
+			rightImage = rightImage.transformed(by: CGAffineTransform(
+				translationX: CGFloat(shiftRight),
+				y: CGFloat(verticalCorrection)
+			))
 
-			// Crop to overlapping area
-			let cropRect = CGRect(
-				x: abs(halfOffset),
-				y: 0,
-				width: halfWidth - abs(CGFloat(offset)),
-				height: height
-			)
+			// Crop to the area both eyes still cover
+			let x0 = max(shiftLeft, shiftRight)
+			let x1 = min(shiftLeft, shiftRight) + eyeWidth
+			let y0 = max(0, verticalCorrection)
+			let y1 = min(0, verticalCorrection) + eyeHeight
+			guard x1 > x0, y1 > y0 else {
+				throw AnaglyphError.offsetTooLarge(offset, eyeWidth)
+			}
 
+			let cropRect = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
 			leftImage = leftImage.cropped(to: cropRect)
 			rightImage = rightImage.cropped(to: cropRect)
 
@@ -584,55 +758,43 @@ class AnaglyphConverter {
 	private func saveImage(_ image: CIImage, to path: String, quality: Float) throws {
 		let url = URL(fileURLWithPath: path)
 		let fileExtension = url.pathExtension.lowercased()
+		let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+		let qualityOption = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
 
-		// HEIC needs to be written through Core Image; NSBitmapImageRep can't encode it
-		if fileExtension == "heic" {
-			let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-			try ciContext.writeHEIFRepresentation(
-				of: image,
-				to: url,
-				format: .RGBA8,
-				colorSpace: colorSpace,
-				options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): NSNumber(value: quality)]
-			)
-			printFileSize(at: url)
-			return
-		}
-
-		// Create CGImage from CIImage
-		guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
-			throw AnaglyphError.failedToCreateCGImage
-		}
-
-		// Create NSBitmapImageRep
-		let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
-
-		// Determine file type and properties
-		let fileType: NSBitmapImageRep.FileType
-		var properties: [NSBitmapImageRep.PropertyKey: Any] = [:]
-
+		// Core Image encodes straight from its own render; bouncing through CGImage and
+		// NSBitmapImageRep copies the full-size output twice more
 		switch fileExtension {
-		case "jpg", "jpeg":
-			fileType = .jpeg
-			properties[.compressionFactor] = NSNumber(value: quality)
+		case "heic":
+			try ciContext.writeHEIFRepresentation(
+				of: image, to: url, format: .RGBA8, colorSpace: colorSpace,
+				options: [qualityOption: NSNumber(value: quality)]
+			)
+
 		case "png":
-			fileType = .png
-		case "tiff", "tif":
-			fileType = .tiff
-			properties[.compressionMethod] = NSNumber(value: NSBitmapImageRep.TIFFCompression.lzw.rawValue)
-		case "bmp":
-			fileType = .bmp
+			try ciContext.writePNGRepresentation(of: image, to: url, format: .RGBA8, colorSpace: colorSpace)
+
+		case "tiff", "tif", "bmp":
+			// Core Image has no BMP writer and writes uncompressed TIFF, so these still go through AppKit
+			guard let cgImage = ciContext.createCGImage(image, from: image.extent) else {
+				throw AnaglyphError.failedToCreateCGImage
+			}
+			let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+			let isTIFF = fileExtension != "bmp"
+			let properties: [NSBitmapImageRep.PropertyKey: Any] = isTIFF
+				? [.compressionMethod: NSNumber(value: NSBitmapImageRep.TIFFCompression.lzw.rawValue)]
+				: [:]
+			guard let data = bitmapRep.representation(using: isTIFF ? .tiff : .bmp, properties: properties) else {
+				throw AnaglyphError.failedToGenerateImageData
+			}
+			try data.write(to: url)
+
 		default:
-			fileType = .jpeg
-			properties[.compressionFactor] = NSNumber(value: quality)
+			try ciContext.writeJPEGRepresentation(
+				of: image, to: url, colorSpace: colorSpace,
+				options: [qualityOption: NSNumber(value: quality)]
+			)
 		}
 
-		// Generate data and write to file
-		guard let data = bitmapRep.representation(using: fileType, properties: properties) else {
-			throw AnaglyphError.failedToGenerateImageData
-		}
-
-		try data.write(to: url)
 		printFileSize(at: url)
 	}
 
@@ -654,6 +816,7 @@ enum AnaglyphError: LocalizedError {
 	case failedToGenerateOutput
 	case failedToCreateCGImage
 	case failedToGenerateImageData
+	case offsetTooLarge(Int, Int)
 
 	var errorDescription: String? {
 		switch self {
@@ -667,6 +830,8 @@ enum AnaglyphError: LocalizedError {
 			return "Failed to create CGImage for saving"
 		case .failedToGenerateImageData:
 			return "Failed to generate image data for saving"
+		case .offsetTooLarge(let offset, let eyeWidth):
+			return "Offset of \(offset) pixels leaves no overlap between eyes \(eyeWidth) pixels wide"
 		}
 	}
 }
@@ -819,8 +984,8 @@ func printHelp() {
 		-n, --name             Use mode-based naming (default: only append -anaglyph to file name)
 							   mode-based naming appends -anaglyph-<mode> to file name
 		-q, --quality <0-1>    JPEG compression quality (default: 0.9)
-		-a, --auto             Auto-detect optimal offset using disparity analysis
-		-f, --fast             Fast mode (fewer samples, less accurate but quicker)
+		-a, --auto             Auto-detect offset and vertical alignment from the stereo pair
+		-f, --fast             Fast mode (lower analysis resolution, coarser result)
 		--offset <pixels>      Manual offset override (negative = closer convergence)
 							   Bare signed numbers (e.g. -100 or +40) are shorthand for --offset
 		-v, --verbose          Show detailed processing information
@@ -833,13 +998,12 @@ func printHelp() {
 		grayscale  - Grayscale anaglyph (reduces color rivalry)
 
 	Auto-Detection:
-		The -a flag analyzes the stereo pair to find the main subject depth
-		and automatically sets the convergence to place it at screen depth.
-		This works by:
-		1. Finding matching features between left/right images
-		2. Calculating disparity (depth) for each feature
-		3. Identifying the main subject depth range
-		4. Setting offset to bring main subject to zero disparity
+		The -a flag block-matches the two views (on a reduced copy, so it is
+		fast even for very large images) and sets the convergence so the
+		nearest content sits at screen depth. Everything else then appears
+		behind the screen, where red/cyan ghosting is least visible. Any
+		vertical misalignment between the eyes is measured and corrected too.
+		Use -v to see near/far disparity, depth range and a histogram.
 
 	Manual Offset Guidelines:
 		0         - No adjustment (default)

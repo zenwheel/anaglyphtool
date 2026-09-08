@@ -16,8 +16,8 @@ Each input image is expected to be a side-by-side (SBS) stereo pair. Output file
 | `-m, --mode <mode>` | Anaglyph mode: `simple`, `optimized`, `dubois`, `grayscale` (default: `simple`) |
 | `-n, --name` | Use mode-based naming: appends `-anaglyph-<mode>` instead of `-anaglyph` |
 | `-q, --quality <0-1>` | JPEG compression quality (default: 0.9) |
-| `-a, --auto` | Auto-detect optimal offset using stereo disparity analysis |
-| `-f, --fast` | Fast mode for auto-detection (fewer samples, quicker) |
+| `-a, --auto` | Auto-detect the offset and vertical alignment from the stereo pair |
+| `-f, --fast` | Fast mode for auto-detection (lower analysis resolution) |
 | `--offset <pixels>` | Manual convergence offset (negative = closer convergence) |
 | `-v, --verbose` | Show detailed processing information |
 | `-h, --help` | Show help |
@@ -43,7 +43,7 @@ The offset shifts the left and right views toward each other to control where th
 | `-80` to `-100` | Close subjects |
 | beyond `-100` | Very close / macro subjects |
 
-Alternatively, `-a` analyzes the stereo pair with block matching to find the main subject's disparity and sets the offset to bring it to screen depth automatically.
+Alternatively, `-a` block-matches the two views and sets the offset so the nearest content sits at screen depth. Everything else then appears behind the screen, which is the most comfortable arrangement for red/cyan glasses: crossed (in-front) parallax is where ghosting is most visible. Matching runs on a reduced copy of the image, so it takes a fraction of a second even for 10,000-pixel-wide pairs, and flat or repetitive areas (sky, backdrops, foliage) are ignored rather than allowed to skew the result. Any vertical misalignment between the two eyes is measured and corrected at the same time. Add `-v` to see the measured near and far disparity, the depth range as a fraction of the width, and a histogram of the depth distribution.
 
 ### Examples
 
